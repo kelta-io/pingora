@@ -410,7 +410,8 @@ impl L4BufferSettings {
 
     /// Resolved read buffer size after applying defaults.
     pub fn read_capacity(&self) -> usize {
-        self.read.unwrap_or(DEFAULT_L4_READ_BUFFER_SIZE)
+        // kelta-io fork (kn-edge M1): never zero, see `From<TcpStream>`.
+        self.read.unwrap_or(DEFAULT_L4_READ_BUFFER_SIZE).max(1)
     }
 
     /// Resolved write buffer size after applying defaults.
@@ -546,8 +547,11 @@ impl Stream {
 impl From<TcpStream> for Stream {
     fn from(s: TcpStream) -> Self {
         Stream {
+            // kelta-io fork (kn-edge M1): tokio >= 1.54 asserts a read capacity above zero;
+            // one byte keeps reads unbuffered (a read of at least one byte bypasses the buffer).
+            // Upstream: cloudflare/pingora#1059, #1060.
             stream: Some(BufStream::with_capacity(
-                0,
+                1,
                 0,
                 RawStreamWrapper::new(RawStream::Tcp(s)),
             )),
@@ -569,8 +573,11 @@ impl From<TcpStream> for Stream {
 impl From<virt::VirtualSocketStream> for Stream {
     fn from(s: virt::VirtualSocketStream) -> Self {
         Stream {
+            // kelta-io fork (kn-edge M1): tokio >= 1.54 asserts a read capacity above zero;
+            // one byte keeps reads unbuffered (a read of at least one byte bypasses the buffer).
+            // Upstream: cloudflare/pingora#1059, #1060.
             stream: Some(BufStream::with_capacity(
-                0,
+                1,
                 0,
                 RawStreamWrapper::new(RawStream::Virtual(s)),
             )),
@@ -593,8 +600,11 @@ impl From<virt::VirtualSocketStream> for Stream {
 impl From<UnixStream> for Stream {
     fn from(s: UnixStream) -> Self {
         Stream {
+            // kelta-io fork (kn-edge M1): tokio >= 1.54 asserts a read capacity above zero;
+            // one byte keeps reads unbuffered (a read of at least one byte bypasses the buffer).
+            // Upstream: cloudflare/pingora#1059, #1060.
             stream: Some(BufStream::with_capacity(
-                0,
+                1,
                 0,
                 RawStreamWrapper::new(RawStream::Unix(s)),
             )),
