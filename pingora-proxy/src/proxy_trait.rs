@@ -668,6 +668,31 @@ pub trait ProxyHttp {
         }
     }
 
+    /// This filter is called when a request is refused before any other filter runs, so no
+    /// `CTX` exists yet:
+    ///
+    /// - `400`: the request header could not be read or failed validation (a malformed request
+    ///   line or header, a header over the size cap, ambiguous framing, or an authority that
+    ///   differs from `Host`). `error` is the read error. The header is available through
+    ///   [`HttpSession::req_header_opt()`] only when it was parsed and then failed validation.
+    /// - `405`: the method is `CONNECT` and CONNECT proxying is not allowed. `error` is `None`.
+    ///
+    /// Users may write their own error response with
+    /// [`HttpSession::write_error_response()`]. The connection is closed after this filter,
+    /// whatever it writes. By default, Pingora's generic error response for `status` is written.
+    // kelta-io fork (kn-edge, spec p1/10 Responses → Edge errors): the edge answers these with its
+    // own envelope and headers instead of Pingora's bare response.
+    async fn early_error_response(
+        &self,
+        session: &mut HttpSession,
+        status: u16,
+        _error: Option<&Error>,
+    ) {
+        session.respond_error(status).await.unwrap_or_else(|e| {
+            error!("failed to send error response to downstream: {e}");
+        });
+    }
+
     /// Decide whether should serve stale when encountering an error or during revalidation
     ///
     /// An implementation should follow

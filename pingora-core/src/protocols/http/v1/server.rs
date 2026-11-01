@@ -554,6 +554,16 @@ impl HttpSession {
             .expect("Request header is not read yet")
     }
 
+    /// Return the `RequestHeader` this session read, or `None` when no header was parsed.
+    ///
+    /// Unlike [`Self::req_header()`] this never panics. After [`Self::read_request()`] failed, the
+    /// header is present only when it was parsed and then failed validation.
+    // kelta-io fork (kn-edge, spec p1/10 Responses → Edge errors): read by
+    // `ProxyHttp::early_error_response`.
+    pub fn req_header_opt(&self) -> Option<&RequestHeader> {
+        self.request_header.as_deref()
+    }
+
     /// Return a mutable reference of the `RequestHeader` this session read
     /// # Panics
     /// this function and most other functions will panic if called before [`Self::read_request()`]
