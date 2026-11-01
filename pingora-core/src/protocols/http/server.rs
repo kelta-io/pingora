@@ -139,6 +139,22 @@ impl Session {
         }
     }
 
+    /// Return the request header it read, or `None` when no header was parsed.
+    ///
+    /// Unlike [`Self::req_header()`] this never panics. After [`Self::read_request()`] failed, an
+    /// HTTP/1 header is present only when it was parsed and then failed validation. HTTP/2 and
+    /// custom sessions always have their header.
+    // kelta-io fork (kn-edge, spec p1/10 Responses → Edge errors): read by
+    // `ProxyHttp::early_error_response`.
+    pub fn req_header_opt(&self) -> Option<&RequestHeader> {
+        match self {
+            Self::H1(s) => s.req_header_opt(),
+            Self::H2(s) => Some(s.req_header()),
+            Self::Subrequest(s) => s.req_header_opt(),
+            Self::Custom(s) => Some(s.req_header()),
+        }
+    }
+
     /// Return a mutable reference to request header it just read.
     /// # Panic
     /// This function will panic if [`Self::read_request()`] is not called.

@@ -223,6 +223,12 @@ impl HttpSession {
         self.v1_inner.req_header()
     }
 
+    /// Return the `RequestHeader` this session read, or `None` when no header was parsed.
+    // kelta-io fork (kn-edge): see `v1::server::HttpSession::req_header_opt`.
+    pub fn req_header_opt(&self) -> Option<&RequestHeader> {
+        self.v1_inner.req_header_opt()
+    }
+
     /// Return a mutable reference of the `RequestHeader` this session read
     /// # Panics
     /// this function and most other functions will panic if called before [`Self::read_request()`]

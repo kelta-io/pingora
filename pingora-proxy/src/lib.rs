@@ -352,12 +352,9 @@ where
                         "Fail to proxy: {e}, downstream session type: {}",
                         downstream_session.session_type()
                     );
-                    downstream_session
-                        .respond_error(400)
-                        .await
-                        .unwrap_or_else(|e| {
-                            error!("failed to send error response to downstream: {e}");
-                        });
+                    self.inner
+                        .early_error_response(&mut downstream_session, 400, Some(&e))
+                        .await;
                 } else {
                     // otherwise the connection must be broken, no need to send anything
                     error!(
@@ -385,12 +382,9 @@ where
             .is_some_and(|opts| opts.allow_connect_method_proxying)
             && downstream_session.req_header().method == Method::CONNECT
         {
-            downstream_session
-                .respond_error(405)
-                .await
-                .unwrap_or_else(|e| {
-                    error!("failed to send error response to downstream: {e}");
-                });
+            self.inner
+                .early_error_response(&mut downstream_session, 405, None)
+                .await;
             downstream_session.shutdown().await;
             return None;
         }
@@ -2581,6 +2575,135 @@ mod tests {
         ) -> Result<Box<HttpPeer>> {
             Err(Error::new(InternalError))
         }
+    }
+
+    /// kelta-io fork: records what `early_error_response` saw and answers with its own response.
+    #[derive(Default)]
+    struct EarlyErrorProxy {
+        /// (status, the raw path when the header was parsed, an error was given)
+        seen: Mutex<Vec<(u16, Option<String>, bool)>>,
+    }
+
+    #[async_trait]
+    impl ProxyHttp for EarlyErrorProxy {
+        type CTX = ();
+        fn new_ctx(&self) -> Self::CTX {}
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            Err(Error::new(InternalError))
+        }
+        async fn early_error_response(
+            &self,
+            session: &mut HttpSession,
+            status: u16,
+            error: Option<&Error>,
+        ) {
+            let path = session
+                .req_header_opt()
+                .map(|h| String::from_utf8_lossy(h.raw_path()).into_owned());
+            self.seen
+                .lock()
+                .unwrap()
+                .push((status, path, error.is_some()));
+            let mut resp = ResponseHeader::build(status, None).unwrap();
+            resp.insert_header("x-early", "1").unwrap();
+            resp.insert_header(header::CONTENT_LENGTH, 2).unwrap();
+            session
+                .write_error_response(resp, Bytes::from_static(b"{}"))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Runs one request through `handle_new_request`; returns whether a session came out and the
+    /// bytes written to the client.
+    async fn early<SV>(proxy: &Arc<HttpProxy<SV>>, request: &[u8]) -> (bool, String)
+    where
+        SV: ProxyHttp + Send + Sync + 'static,
+        SV::CTX: Send + Sync,
+    {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let socket = StaticVirtualSocket::new(request, written.clone());
+        let stream = L4Stream::from(VirtualSocketStream::new(Box::new(socket)));
+        let session = Box::new(HttpSession::new_http1(Box::new(stream)));
+        let proceeded = proxy.handle_new_request(session).await.is_some();
+        let written = String::from_utf8_lossy(&written.lock().unwrap()).into_owned();
+        (proceeded, written)
+    }
+
+    #[tokio::test]
+    async fn early_error_response_answers_refusals_before_any_filter() {
+        let proxy = Arc::new(HttpProxy::new(
+            EarlyErrorProxy::default(),
+            Arc::new(ServerConf::default()),
+        ));
+        let cases: [(&[u8], &str); 4] = [
+            // parsed, then refused by validation: the header is available
+            (
+                b"GET http://other.example/x HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                "HTTP/1.1 400",
+            ),
+            // not parsed: no header
+            (
+                b"GET /x HTTP/1.1\r\nHost: example.com\r\nbad header\r\n\r\n",
+                "HTTP/1.1 400",
+            ),
+            // the fork's framing check
+            (
+                b"POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                "HTTP/1.1 400",
+            ),
+            // CONNECT while CONNECT proxying is off
+            (
+                b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+                "HTTP/1.1 405",
+            ),
+        ];
+        for (request, status_line) in cases {
+            let (proceeded, written) = early(&proxy, request).await;
+            assert!(!proceeded, "{written}");
+            assert!(written.starts_with(status_line), "{written}");
+            assert!(written.contains("x-early: 1"), "{written}");
+            assert!(
+                !written.to_ascii_lowercase().contains("pingora"),
+                "{written}"
+            );
+            assert!(written.ends_with("\r\n\r\n{}"), "{written}");
+        }
+        let seen = proxy.inner.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (400, Some("http://other.example/x".to_string()), true),
+                (400, None, true),
+                (400, None, true),
+                (405, Some("example.com:443".to_string()), false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn early_error_response_defaults_to_the_generic_response() {
+        let proxy = Arc::new(HttpProxy::new(NoopProxy, Arc::new(ServerConf::default())));
+        let (proceeded, written) = early(
+            &proxy,
+            b"GET http://other.example/x HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        .await;
+        assert!(!proceeded);
+        assert!(written.starts_with("HTTP/1.1 400"), "{written}");
+        assert!(
+            written.to_ascii_lowercase().contains("server: pingora"),
+            "{written}"
+        );
+
+        let (proceeded, written) =
+            early(&proxy, b"GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+        assert!(proceeded, "{written}");
+        assert!(written.is_empty(), "{written}");
     }
 
     fn pending_session() -> Box<HttpSession> {
