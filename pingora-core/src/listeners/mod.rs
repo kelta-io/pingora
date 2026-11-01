@@ -590,7 +590,8 @@ mod test {
 
         assert_eq!(listeners.stacks.len(), 1);
         assert_eq!(listeners.stacks[0].l4_buffer, l4_buffer);
-        assert_eq!(listeners.stacks[0].l4_buffer.read_capacity(), 0);
+        // kn: an unbuffered read is capacity 1, never 0 (tokio 1.54, protocols/l4/stream.rs).
+        assert_eq!(listeners.stacks[0].l4_buffer.read_capacity(), 1);
         assert_eq!(
             listeners.stacks[0].l4_buffer.write_capacity(),
             DEFAULT_L4_WRITE_BUFFER_SIZE
@@ -615,7 +616,8 @@ mod test {
 
         assert_eq!(listeners.stacks.len(), 1);
         assert_eq!(listeners.stacks[0].l4_buffer, l4_buffer);
-        assert_eq!(listeners.stacks[0].l4_buffer.read_capacity(), 0);
+        // kn: an unbuffered read is capacity 1, never 0 (tokio 1.54, protocols/l4/stream.rs).
+        assert_eq!(listeners.stacks[0].l4_buffer.read_capacity(), 1);
         assert_eq!(listeners.stacks[0].l4_buffer.write_capacity(), 0);
 
         match &listeners.stacks[0].l4 {

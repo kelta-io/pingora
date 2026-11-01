@@ -160,6 +160,24 @@ pub struct HttpSession {
     pipelined_idle_bytes_stashed: bool,
 }
 
+/// kelta-io fork: `true` when the head holds a LF not preceded by CR.
+fn has_bare_lf(head: &[u8]) -> bool {
+    head.iter()
+        .enumerate()
+        .any(|(i, b)| *b == b'\n' && (i == 0 || head[i - 1] != b'\r'))
+}
+
+/// kelta-io fork: `true` when Transfer-Encoding is one header whose value is `chunked`.
+fn is_single_chunked(headers: &http::HeaderMap) -> bool {
+    let mut values = headers.get_all(TRANSFER_ENCODING).iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) => value
+            .to_str()
+            .is_ok_and(|v| v.trim().eq_ignore_ascii_case("chunked")),
+        _ => false,
+    }
+}
+
 impl HttpSession {
     /// Create a new http server session from an established (TCP or TLS) [`Stream`].
     /// The created session needs to call [`Self::read_request()`] first before performing
@@ -409,8 +427,18 @@ impl HttpSession {
                         // also requires us to disable keepalive when both headers are present.
                         let has_both_te_and_cl =
                             contains_content_length && contains_transfer_encoding;
+                        // kelta-io fork (kn-edge, spec p1/10 Limits → Framing): a request with
+                        // both framing headers is refused (400, connection closed) instead of
+                        // being reframed by Transfer-Encoding; the edge is the first HTTP parser.
                         if has_both_te_and_cl {
-                            request_header.remove_header(&CONTENT_LENGTH);
+                            return Error::e_explain(
+                                InvalidHTTPHeader,
+                                "both Content-Length and Transfer-Encoding",
+                            );
+                        }
+                        // kelta-io fork: a bare LF line ending in the head is refused.
+                        if has_bare_lf(&buf[..s]) {
+                            return Error::e_explain(InvalidHTTPHeader, "bare LF in the request head");
                         }
 
                         self.buf = buf;
@@ -507,6 +535,10 @@ impl HttpSession {
             // See https://datatracker.ietf.org/doc/html/rfc9112#section-6.3-2.4.3
             if !self.is_chunked_encoding() {
                 return Error::e_explain(InvalidHTTPHeader, "non-chunked final Transfer-Encoding");
+            }
+            // kelta-io fork (kn-edge, spec p1/10 Limits → Framing): exactly one coding, `chunked`.
+            if !is_single_chunked(&req_header.headers) {
+                return Error::e_explain(InvalidHTTPHeader, "Transfer-Encoding other than one chunked");
             }
         }
 
@@ -2168,7 +2200,13 @@ mod tests_stream {
             .read(input2.as_bytes())
             .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let _ = http_stream.read_request().await.unwrap();
+        let read = http_stream.read_request().await;
+        // kelta-io fork: both framing headers are refused, never reframed.
+        if content_length_header.is_some() && transfer_encoding_header.is_some() {
+            assert_eq!(read.unwrap_err().etype(), &InvalidHTTPHeader);
+            return;
+        }
+        let _ = read.unwrap();
 
         match (content_length_header, transfer_encoding_header) {
             (Some(_) | None, Some(_)) => {
@@ -3106,22 +3144,9 @@ hello\r\n\
 \r\n";
         let mock_io = Builder::new().read(&input[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-
-        // Keepalive should be disabled
-        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Off);
-
-        // Content-Length header should have been removed
-        assert!(!http_stream
-            .req_header()
-            .headers
-            .contains_key(CONTENT_LENGTH));
-
-        // Transfer-Encoding should still be present
-        assert!(http_stream
-            .req_header()
-            .headers
-            .contains_key(TRANSFER_ENCODING));
+        // kelta-io fork: refused (400, connection closed) instead of reframed.
+        let err = http_stream.read_request().await.unwrap_err();
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
     }
 
     #[tokio::test]
@@ -3199,14 +3224,9 @@ hello\r\n\
 
         let mock_io = Builder::new().read(&input[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-
-        // Should correctly identify chunked encoding from last header
-        assert!(http_stream.is_chunked_encoding());
-
-        // Verify body can be read correctly
-        let body = http_stream.read_body_bytes().await.unwrap();
-        assert_eq!(body.unwrap().as_ref(), b"hello");
+        // kelta-io fork: only a single `chunked` coding is accepted.
+        let err = http_stream.read_request().await.unwrap_err();
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
     }
 
     #[tokio::test]
@@ -4542,22 +4562,9 @@ mod test_pipelining {
         let mut session = HttpSession::new(Box::new(mock_io));
         session.set_pipelining_enabled(true);
         session.set_pipelined_prefix(prefix);
-        session.read_request().await.unwrap();
-        assert_eq!(session.get_path(), b"/one?q=a%20b");
-
-        let reused = session.reuse().await.unwrap().expect("connection reusable");
-        let (stream, prefix) = reused.into_parts();
-        let prefix = prefix.expect("second request remains buffered");
-        assert_eq!(prefix.as_ref(), req2);
-
-        let mut next = HttpSession::new(stream);
-        next.set_pipelining_enabled(true);
-        next.set_pipelined_prefix(prefix);
-        next.read_request()
-            .await
-            .unwrap()
-            .expect("pipelined request must parse");
-        assert_eq!(next.req_header().uri.path(), "/two");
+        // kelta-io fork: a head with a bare LF line ending is refused, so nothing is pipelined.
+        let err = session.read_request().await.unwrap_err();
+        assert_eq!(err.etype(), &InvalidHTTPHeader);
     }
 
     #[tokio::test]
