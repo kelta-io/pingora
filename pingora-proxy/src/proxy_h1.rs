@@ -324,8 +324,18 @@ where
                 },
 
                 body = rx.recv(), if !request_done => {
+                    // The 101 can be read before the request's own end of body
+                    // (`HttpTask::Body(_, true)`) is consumed from the pipe. That task ends the
+                    // request as it was before the upgrade, not the tunnel: after an upgrade
+                    // only the upgraded body's end (`UpgradedBody(_, true)`) or a closed pipe
+                    // ends the request side, and with it the loop.
+                    let pre_upgrade_body =
+                        client_session.was_upgraded() && matches!(body, Some(HttpTask::Body(..)));
                     match send_body_to1(client_session, body).await {
                         Ok(send_done) => {
+                            if pre_upgrade_body {
+                                continue;
+                            }
                             request_done = send_done;
                             // An upgraded request is terminated when either side is done
                             if request_done && client_session.was_upgraded() {
@@ -1267,5 +1277,80 @@ mod tests {
 
         assert_eq!(err.etype(), &InvalidHTTPHeader);
         assert_eq!(err.esource(), &ErrorSource::Upstream);
+    }
+
+    /// The upgrade race (kelta-io fork, patch (f)): the upstream half reads the `101` before it
+    /// consumes the request's own end of body, `HttpTask::Body(None, true)`. That task must not
+    /// end the tunnel: the upgraded bytes that follow still reach the upstream.
+    #[tokio::test]
+    async fn pre_upgrade_end_of_body_after_101_keeps_the_tunnel_open() {
+        use pingora_core::protocols::http::v1::client::HttpSession as ClientSession;
+        use std::sync::atomic::AtomicU8;
+        use tokio::io::AsyncReadExt;
+
+        let proxy = HttpProxy::new(ResponseFilter101, Arc::new(ServerConf::default()));
+        let (client_io, mut upstream) = tokio::io::duplex(4096);
+        let mut client_session =
+            ClientSession::new(Box::new(client_io) as pingora_core::protocols::Stream);
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("Host", "example.com").unwrap();
+        req.insert_header("Upgrade", "websocket").unwrap();
+        req.insert_header("Connection", "Upgrade").unwrap();
+        client_session
+            .write_request_header(Box::new(req))
+            .await
+            .unwrap();
+
+        let mut head = [0u8; 1024];
+        let n = upstream.read(&mut head).await.unwrap();
+        assert!(head[..n].starts_with(b"GET / HTTP/1.1"));
+        upstream
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            .await
+            .unwrap();
+
+        let (down_tx, mut down_rx) = mpsc::channel(4);
+        let (up_tx, up_rx) = mpsc::channel(4);
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+        let handle = async move {
+            proxy
+                .proxy_handle_upstream(&mut client_session, down_tx, up_rx, pipe_state)
+                .await
+        };
+        let mut handle = Box::pin(handle);
+
+        // Drive the loop until it has read the 101, before any body task is queued.
+        let header = tokio::select! {
+            task = down_rx.recv() => task.unwrap(),
+            res = &mut handle => panic!("loop ended before the 101: {res:?}"),
+        };
+        assert!(matches!(header, HttpTask::Header(ref h, _) if h.status == 101));
+
+        // The request's own end of body arrives only now, then the first upgraded bytes.
+        up_tx.send(HttpTask::Body(None, true)).await.unwrap();
+        up_tx
+            .send(HttpTask::UpgradedBody(
+                Some(Bytes::from_static(b"ping")),
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 4];
+        tokio::select! {
+            res = upstream.read_exact(&mut buf) => { res.unwrap(); }
+            res = &mut handle => panic!("loop ended on the pre-upgrade end of body: {res:?}"),
+        }
+        assert_eq!(&buf, b"ping");
+
+        // The tunnel ends on the upgraded body's end.
+        up_tx
+            .send(HttpTask::UpgradedBody(None, true))
+            .await
+            .unwrap();
+        tokio::select! {
+            res = &mut handle => { res.unwrap(); }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("loop did not end"),
+        }
     }
 }
